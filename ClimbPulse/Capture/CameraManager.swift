@@ -73,6 +73,9 @@ class CameraManager: NSObject, ObservableObject {
     
     private var timer: Timer?
     private let recordingDuration: Int = 30
+
+    // Throttle for the torch keep-alive check (MainActor-isolated).
+    private var lastTorchCheck: Date = .distantPast
     
     private let ppgProcessor = PPGProcessor()
     private var lastBPMUpdate: Date = Date()
@@ -182,15 +185,17 @@ class CameraManager: NSObject, ObservableObject {
             
             do {
                 let (session, output) = try self.setupCaptureSession()
-                
-                // Enable torch (flash) for illumination
-                self.setTorch(on: true)
-                
+
                 // Set recording start time before starting session
                 self.recordingState.startTime = Date()
-                
+
                 // Start capture session
                 session.startRunning()
+
+                // Enable torch (flash) for illumination.
+                // Must be done AFTER the session is running, otherwise starting
+                // the session resets the torch mode and the flash never turns on.
+                try self.setTorch(on: true)
                 
                 Task { @MainActor in
                     self.captureSession = session
@@ -216,8 +221,14 @@ class CameraManager: NSObject, ObservableObject {
         
         sessionQueue.async { [weak self] in
             guard let self = self else { return }
-            
-            self.setTorch(on: false)
+
+            do {
+                try self.setTorch(on: false)
+            } catch {
+                Task { @MainActor in
+                    self.errorMessage = "Failed to turn off flash: \(error.localizedDescription)"
+                }
+            }
             session?.stopRunning()
             self.recordingState.startTime = nil
             self.recordingState.startPTS = nil
@@ -233,21 +244,30 @@ class CameraManager: NSObject, ObservableObject {
     // MARK: - Private Methods
     
     /// Enable/disable camera torch.
-    nonisolated private func setTorch(on: Bool) {
+    nonisolated private func setTorch(on: Bool) throws {
         guard let device = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .back),
-              device.hasTorch else { return }
-        
+              device.hasTorch, device.isTorchAvailable else { return }
+
         do {
             try device.lockForConfiguration()
-            device.torchMode = on ? .on : .off
+            defer { device.unlockForConfiguration() }
             if on {
                 let desiredLevel = min(0.6, AVCaptureDevice.maxAvailableTorchLevel)
                 try device.setTorchModeOn(level: desiredLevel)  // Slightly dim to avoid sensor saturation
+            } else {
+                device.torchMode = .off
             }
-            device.unlockForConfiguration()
         } catch {
-            print("Torch error: \(error)")
+            throw CameraError.torchUnavailable(underlying: error)
         }
+    }
+
+    /// Re-assert the torch if something (session reconfiguration, a transient
+    /// interruption) has switched it back off while we are still recording.
+    nonisolated private func ensureTorchOn() throws {
+        guard let device = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .back),
+              device.hasTorch, device.isTorchAvailable, !device.isTorchActive else { return }
+        try setTorch(on: true)
     }
     
     /// Start countdown timer.
@@ -421,6 +441,29 @@ extension CameraManager: AVCaptureVideoDataOutputSampleBufferDelegate {
             sampleRate: sampleRate
         )
         updateBPMIfNeeded()
+        maybeReassertTorch()
+    }
+
+    /// Re-assert the torch at most once per second while recording, in case a
+    /// session reconfiguration or transient interruption switched it back off.
+    /// Hardware access is hopped onto the session queue to stay off the main thread.
+    @MainActor
+    private func maybeReassertTorch() {
+        guard isRecording else { return }
+        let now = Date()
+        guard now.timeIntervalSince(lastTorchCheck) >= 1.0 else { return }
+        lastTorchCheck = now
+
+        sessionQueue.async { [weak self] in
+            guard let self = self else { return }
+            do {
+                try self.ensureTorchOn()
+            } catch {
+                Task { @MainActor in
+                    self.errorMessage = "Flash error: \(error.localizedDescription)"
+                }
+            }
+        }
     }
     
     /// Exponential smoothing for PPG values to suppress frame-to-frame noise.
@@ -509,7 +552,8 @@ enum CameraError: LocalizedError {
     case cameraUnavailable
     case cannotAddInput
     case cannotAddOutput
-    
+    case torchUnavailable(underlying: Error)
+
     var errorDescription: String? {
         switch self {
         case .cameraUnavailable:
@@ -518,6 +562,8 @@ enum CameraError: LocalizedError {
             return "Cannot add camera input"
         case .cannotAddOutput:
             return "Cannot add video output"
+        case .torchUnavailable(let underlying):
+            return "Could not control the camera flash: \(underlying.localizedDescription)"
         }
     }
 }

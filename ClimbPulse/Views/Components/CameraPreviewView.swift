@@ -20,7 +20,12 @@ struct CameraPreviewView: UIViewRepresentable {
     }
     
     func updateUIView(_ uiView: PreviewView, context: Context) {
-        uiView.videoPreviewLayer.session = session
+        // Only (re)assign when the session actually changes. Reassigning the same
+        // session on every SwiftUI re-render reconfigures the running session
+        // repeatedly, which resets the camera torch (flash) back off.
+        if uiView.videoPreviewLayer.session !== session {
+            uiView.videoPreviewLayer.session = session
+        }
     }
 }
 
