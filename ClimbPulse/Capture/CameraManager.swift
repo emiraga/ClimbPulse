@@ -83,7 +83,6 @@ class CameraManager: NSObject, ObservableObject {
     @Published var currentBPM: Int?
     @Published var samples: [PPGSample] = []
     @Published var filteredSamples: [PPGSample] = []  // Band-passed samples for UI display
-    @Published var timeRemaining: Int = 60
     @Published var errorMessage: String?
     @Published var isAuthorized = false
     @Published private(set) var captureSession: AVCaptureSession?
@@ -100,8 +99,6 @@ class CameraManager: NSObject, ObservableObject {
             UserDefaults.standard.set(selectedCameraID, forKey: Self.selectedCameraKey)
         }
     }
-
-    var recordingLength: Int { recordingDuration }
 
     // MARK: - Camera Discovery
 
@@ -121,23 +118,31 @@ class CameraManager: NSObject, ObservableObject {
     private let sessionQueue = DispatchQueue(label: "com.climbpulse.camera.session")
     private let processingQueue = DispatchQueue(label: "com.climbpulse.camera.processing")
     private var previousRedValue: Double?
-    
+
     // Thread-safe recording state
     private let recordingState = RecordingState()
-    
-    private var timer: Timer?
-    private let recordingDuration: Int = 60
 
     // Throttle for the torch keep-alive check (MainActor-isolated).
     private var lastTorchCheck: Date = .distantPast
-    
+
     private let ppgProcessor = PPGProcessor()
     private var lastBPMUpdate: Date = Date()
     private let bpmUpdateInterval: TimeInterval = 2.0  // Update BPM every 2 seconds
     private var detectionStartTimestamp: Double?
-    
-    // Start countdown only after BPM detected
-    private var countdownStarted = false
+
+    /// Trailing window (seconds) used for the live BPM readout. Kept short so the
+    /// displayed value tracks the current heartbeat instead of averaging over the
+    /// whole (now open-ended) recording.
+    private let liveBPMWindowSeconds: Double = 6.0
+
+    /// Cap on how much recent signal we retain while recording. The measurement
+    /// now runs indefinitely, so we keep only a rolling window to bound memory and
+    /// per-frame processing cost; everything the UI and BPM estimate need lives
+    /// well within this span.
+    private let maxRetainedSeconds: Double = 20.0
+
+    // Only mark the detection start (to trim the noisy lead-in) once BPM appears.
+    private var detectionStarted = false
     
     // Completion handler for when recording finishes
     var onRecordingComplete: ((Measurement?) -> Void)?
@@ -319,13 +324,12 @@ class CameraManager: NSObject, ObservableObject {
         samples = []
         filteredSamples = []
         currentBPM = nil
-        timeRemaining = recordingDuration
         errorMessage = nil
         recordingState.startTime = nil
         recordingState.startPTS = nil
         captureSession = nil
         signalQuality = .noisy
-        countdownStarted = false
+        detectionStarted = false
         previousRedValue = nil
         detectionStartTimestamp = nil
 
@@ -353,8 +357,8 @@ class CameraManager: NSObject, ObservableObject {
                     self.captureSession = session
                     self.videoOutput = output
                     self.isRecording = true
-                    // NOTE: Do NOT start the timer here.
-                    // We only start the countdown after BPM is detected.
+                    // Recording runs indefinitely until the user stops it; there
+                    // is no countdown to start.
                 }
             } catch {
                 Task { @MainActor in
@@ -366,9 +370,6 @@ class CameraManager: NSObject, ObservableObject {
     
     /// Stop recording and process final results.
     func stopRecording() {
-        timer?.invalidate()
-        timer = nil
-        
         let session = captureSession
         
         sessionQueue.async { [weak self] in
@@ -403,11 +404,6 @@ class CameraManager: NSObject, ObservableObject {
         selectedCameraID = id
 
         guard isRecording else { return }
-
-        // Stop the countdown; startRecording() will restart it once BPM is
-        // re-detected on the new lens.
-        timer?.invalidate()
-        timer = nil
 
         // Stop the old session first. sessionQueue is serial, so this is
         // guaranteed to run before startRecording()'s setup below. Stopping the
@@ -449,22 +445,6 @@ class CameraManager: NSObject, ObservableObject {
         guard let device = Self.resolveCamera(id: recordingState.cameraID),
               device.hasTorch, device.isTorchAvailable, !device.isTorchActive else { return }
         try setTorch(on: true)
-    }
-    
-    /// Start countdown timer.
-    private func startTimer() {
-        timer?.invalidate()
-        timer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
-            guard let self = self else { return }
-            
-            Task { @MainActor in
-                if self.timeRemaining > 0 {
-                    self.timeRemaining -= 1
-                } else {
-                    self.stopRecording()
-                }
-            }
-        }
     }
     
     /// Calculate estimated sample rate from collected samples.
@@ -551,32 +531,35 @@ class CameraManager: NSObject, ObservableObject {
         lastBPMUpdate = now
         
         let sampleRate = estimatedSampleRate()
-        
-        // Compute BPM
-        let bpm = ppgProcessor.calculateBPM(from: samples, sampleRate: sampleRate)
+
+        // Compute BPM from only the most recent window so the live readout tracks
+        // the current heartbeat rather than averaging over the whole recording.
+        let bpm = ppgProcessor.calculateBPM(
+            from: samples,
+            sampleRate: sampleRate,
+            windowSeconds: liveBPMWindowSeconds
+        )
         self.currentBPM = bpm
-        
-        // Refresh signal quality alongside BPM updates
+
+        // Refresh signal quality alongside BPM updates. `samples` is already a
+        // bounded rolling window, so this stays recent and cheap.
         if !samples.isEmpty {
             self.signalQuality = ppgProcessor.assessQuality(samples: samples, sampleRate: sampleRate)
         }
-        
-        // Start countdown only when BPM is first detected.
-        if !countdownStarted, bpm != nil {
-            beginCountdownFromNow()
+
+        // Mark where the stable signal begins (once) so the saved measurement can
+        // trim the noisy lead-in before BPM was first detected.
+        if !detectionStarted, bpm != nil {
+            markDetectionStart()
         }
     }
-    
-    /// Rebase timestamps and storage so we only keep data from the moment BPM was detected,
-    /// and start the countdown from that moment.
-    private func beginCountdownFromNow() {
-        countdownStarted = true
-        
-        // Start countdown without clearing existing samples to avoid visible jumps
+
+    /// Record the timestamp where a valid BPM was first detected so we can trim
+    /// the noisy lead-in from the saved measurement.
+    private func markDetectionStart() {
+        detectionStarted = true
         self.recordingState.startTime = Date()
         self.detectionStartTimestamp = samples.last?.timestamp
-        self.timeRemaining = recordingDuration
-        self.startTimer()
     }
 }
 
@@ -614,7 +597,14 @@ extension CameraManager: AVCaptureVideoDataOutputSampleBufferDelegate {
         let limited = clampJump(smoothed)
         let sample = PPGSample(timestamp: timestamp, value: limited)
         samples.append(sample)
-        
+
+        // The recording now runs indefinitely, so keep only a trailing window to
+        // bound memory and per-frame processing cost.
+        let cutoff = timestamp - maxRetainedSeconds
+        if let first = samples.first, first.timestamp < cutoff {
+            samples.removeAll { $0.timestamp < cutoff }
+        }
+
         // Refresh filtered copy for UI and quality estimate
         let sampleRate = estimatedSampleRate()
         filteredSamples = ppgProcessor.filteredForDisplay(

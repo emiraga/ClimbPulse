@@ -2,7 +2,7 @@
 //  RecordingView.swift
 //  ClimbPulse
 //
-//  Live recording screen showing PPG waveform, BPM, and countdown timer.
+//  Live recording screen showing PPG waveform and live BPM. Runs until stopped.
 //
 
 import AVFoundation
@@ -21,12 +21,6 @@ struct RecordingView: View {
     private let darkBlue = Color(red: 0.02, green: 0.16, blue: 0.32)  // #042948
     private let accentOrange = Color(red: 1.0, green: 0.51, blue: 0.0)  // #FF8200
     private let accentYellow = Color(red: 1.0, green: 0.72, blue: 0.11)  // #FFB81C
-
-    private var recordingProgress: Double {
-        guard cameraManager.recordingLength > 0 else { return 0 }
-        let elapsed = Double(cameraManager.recordingLength - cameraManager.timeRemaining)
-        return max(0, min(1, elapsed / Double(cameraManager.recordingLength)))
-    }
 
     private var backgroundGradient: LinearGradient {
         let colors: [Color]
@@ -75,13 +69,12 @@ struct RecordingView: View {
                 BPMPreviewRing(
                     session: cameraManager.captureSession,
                     bpm: cameraManager.currentBPM,
-                    progress: recordingProgress,
                     quality: cameraManager.signalQuality,
                     accent: accentOrange,
                     glow: accentYellow
                 )
 
-                // Countdown timer
+                // Recording controls (measurement runs until the user stops it)
                 VStack(spacing: 10) {
                     HStack(alignment: .center) {
                         // Cancel (left)
@@ -100,16 +93,15 @@ struct RecordingView: View {
 
                         Spacer()
 
-                        // Time center
-                        Text("\(cameraManager.timeRemaining)")
-                            .font(.system(size: 60, weight: .bold, design: .rounded))
+                        // Live "measuring" indicator in place of the old countdown
+                        Label("Measuring", systemImage: "waveform.path.ecg")
+                            .font(.system(size: 18, weight: .semibold, design: .rounded))
                             .foregroundColor(.white)
-                            .monospacedDigit()
-                            .frame(minWidth: 120)
+                            .symbolEffect(.pulse, options: .repeating)
 
                         Spacer()
 
-                        // Stop/save early (right)
+                        // Stop/save (right)
                         Button(action: finishEarly) {
                             Image(systemName: "stop.fill")
                                 .font(.system(size: 16, weight: .bold))
@@ -279,14 +271,9 @@ struct FingerPlacementIndicator: View {
 struct BPMPreviewRing: View {
     let session: AVCaptureSession?
     let bpm: Int?
-    let progress: Double
     let quality: SignalQuality
     let accent: Color
     let glow: Color
-
-    private var clampedProgress: Double {
-        max(0, min(1, progress))
-    }
 
     private var qualityText: String {
         switch quality {
@@ -321,13 +308,8 @@ struct BPMPreviewRing: View {
                 )
                 .clipShape(Circle())
 
-            // Base ring
+            // Ring around the live preview
             Circle()
-                .stroke(Color.white.opacity(0.22), lineWidth: 12)
-
-            // Progress ring (starts when countdown begins)
-            Circle()
-                .trim(from: 0, to: clampedProgress)
                 .stroke(
                     AngularGradient(
                         colors: [
@@ -339,8 +321,6 @@ struct BPMPreviewRing: View {
                     ),
                     style: StrokeStyle(lineWidth: 14, lineCap: .round)
                 )
-                .rotationEffect(.degrees(-90))
-                .animation(.easeInOut(duration: 0.25), value: clampedProgress)
 
             // BPM readout
             VStack(spacing: 4) {

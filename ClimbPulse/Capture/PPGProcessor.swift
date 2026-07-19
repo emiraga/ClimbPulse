@@ -29,12 +29,16 @@ class PPGProcessor {
     /// - Parameters:
     ///   - samples: Array of PPG samples with timestamps
     ///   - sampleRate: Estimated sample rate in Hz
+    ///   - windowSeconds: Length of the trailing window to analyze. Pass a short
+    ///     window (e.g. for the live readout) to track the current heartbeat
+    ///     without averaging over the whole recording.
     /// - Returns: Estimated BPM or nil if insufficient data
-    func calculateBPM(from samples: [PPGSample], sampleRate: Double) -> Int? {
+    func calculateBPM(from samples: [PPGSample], sampleRate: Double, windowSeconds: Double? = nil) -> Int? {
         guard samples.count >= minSamplesForBPM else { return nil }
-        
+
         // Extract values from recent window
-        let windowSamples = getRecentWindow(samples: samples, windowSeconds: windowSeconds)
+        let window = windowSeconds ?? self.windowSeconds
+        let windowSamples = getRecentWindow(samples: samples, windowSeconds: window)
         guard windowSamples.count >= minSamplesForBPM else { return nil }
         
         // Preprocess to remove spikes and normalize amplitude
