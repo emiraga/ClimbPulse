@@ -15,7 +15,12 @@ struct CameraPreviewView: UIViewRepresentable {
     func makeUIView(context: Context) -> PreviewView {
         let view = PreviewView()
         view.videoPreviewLayer.videoGravity = .resizeAspectFill
-        view.videoPreviewLayer.connection?.videoOrientation = .portrait
+        // Portrait orientation. `videoOrientation` was deprecated in iOS 17 in
+        // favor of `videoRotationAngle` (0° = landscape right, 90° = portrait).
+        if let connection = view.videoPreviewLayer.connection,
+           connection.isVideoRotationAngleSupported(90) {
+            connection.videoRotationAngle = 90
+        }
         return view
     }
     

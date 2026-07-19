@@ -7,12 +7,14 @@
 //
 
 import Foundation
-import AVFoundation
+@preconcurrency import AVFoundation
 import UIKit
 import Combine
 
 /// Thread-safe storage for recording start time (accessed from multiple threads).
-final class RecordingState: @unchecked Sendable {
+/// `nonisolated` opts out of the project's default main-actor isolation so the
+/// lock-guarded state can be read/written from the capture delegate's background queue.
+nonisolated final class RecordingState: @unchecked Sendable {
     private let lock = NSLock()
     private var _startTime: Date?
     private var _startPTS: CMTime?
@@ -515,7 +517,6 @@ extension CameraManager: AVCaptureVideoDataOutputSampleBufferDelegate {
         let buffer = baseAddress.assumingMemoryBound(to: UInt8.self)
 
         var greenSum: Int = 0
-        var redSum: Int = 0
         var validPixelCount: Int = 0
 
         // BGRA format: B=0, G=1, R=2, A=3
@@ -527,10 +528,8 @@ extension CameraManager: AVCaptureVideoDataOutputSampleBufferDelegate {
             for x in stride(from: 0, to: width, by: step) {
                 let offset = rowStart + x * 4
                 let green = Int(buffer[offset + 1])  // Green channel
-                let red = Int(buffer[offset + 2])    // Red channel
 
                 greenSum += green
-                redSum += red
                 validPixelCount += 1
             }
         }
@@ -538,10 +537,8 @@ extension CameraManager: AVCaptureVideoDataOutputSampleBufferDelegate {
         guard validPixelCount > 0 else { return nil }  // Need at least one pixel
 
         let avgGreen = Double(greenSum) / Double(validPixelCount)
-        let avgRed = Double(redSum) / Double(validPixelCount)
 
-        // Use green channel for better SNR, or CHROM-inspired approach (green - red) to suppress color drift
-        // Green channel typically has better SNR for PPG than red
+        // Green channel typically has better SNR for PPG than red.
         return avgGreen
     }
 }
