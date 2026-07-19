@@ -90,7 +90,17 @@ struct HomeView: View {
                         InstructionRow(icon: "timer", text: "Hold still for 30 seconds")
                     }
                     .padding(.horizontal, 32)
-                    
+
+                    // Lens selection: on multi-camera phones the lens closest to the
+                    // torch gives the brightest signal — let the user try each one.
+                    if cameraManager.availableCameras.count > 1 {
+                        CameraSelector(
+                            cameras: cameraManager.availableCameras,
+                            selectedID: $cameraManager.selectedCameraID
+                        )
+                        .padding(.horizontal, 32)
+                    }
+
                     Spacer()
                     
                     // Start button
@@ -199,6 +209,58 @@ struct InstructionRow: View {
                 .foregroundColor(colorScheme == .dark ? Color.white.opacity(0.85) : primaryBlue.opacity(0.85))
             
             Spacer()
+        }
+    }
+}
+
+struct CameraSelector: View {
+    let cameras: [CameraOption]
+    @Binding var selectedID: String?
+
+    @Environment(\.colorScheme) private var colorScheme
+    private let primaryBlue = Color(red: 0.0, green: 0.34, blue: 0.65)
+
+    private var selectedName: String {
+        cameras.first(where: { $0.id == selectedID })?.name ?? "Default"
+    }
+
+    var body: some View {
+        Menu {
+            ForEach(cameras) { camera in
+                Button {
+                    selectedID = camera.id
+                } label: {
+                    if camera.id == selectedID {
+                        Label(camera.name, systemImage: "checkmark")
+                    } else {
+                        Text(camera.name)
+                    }
+                }
+            }
+        } label: {
+            HStack(spacing: 10) {
+                Image(systemName: "camera.aperture")
+                    .font(.system(size: 16, weight: .semibold))
+                VStack(alignment: .leading, spacing: 1) {
+                    Text("Camera")
+                        .font(.system(size: 11, weight: .medium, design: .rounded))
+                        .foregroundColor(colorScheme == .dark ? Color.white.opacity(0.6) : primaryBlue.opacity(0.5))
+                    Text(selectedName)
+                        .font(.system(size: 15, weight: .semibold, design: .rounded))
+                }
+                Spacer()
+                Image(systemName: "chevron.up.chevron.down")
+                    .font(.system(size: 13, weight: .semibold))
+            }
+            .foregroundColor(colorScheme == .dark ? Color.white.opacity(0.9) : primaryBlue)
+            .padding(.horizontal, 16)
+            .padding(.vertical, 12)
+            .background(colorScheme == .dark ? Color.white.opacity(0.08) : Color.white)
+            .clipShape(RoundedRectangle(cornerRadius: 12))
+            .overlay(
+                RoundedRectangle(cornerRadius: 12)
+                    .stroke(colorScheme == .dark ? Color.white.opacity(0.08) : primaryBlue.opacity(0.08), lineWidth: 1)
+            )
         }
     }
 }

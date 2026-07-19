@@ -11,14 +11,24 @@ import Foundation
 import UIKit
 import Combine
 
-/// Thread-safe storage for recording start time (accessed from multiple threads).
+/// A selectable rear camera. `id` is the device's stable `uniqueID` so the
+/// user's choice can be persisted and resolved again later.
+struct CameraOption: Identifiable, Hashable, Sendable {
+    let id: String
+    let name: String
+}
+
+/// Thread-safe storage for state accessed from multiple threads (recording
+/// timing plus the currently-selected camera, which the capture/torch code
+/// running on the session queue needs to read).
 /// `nonisolated` opts out of the project's default main-actor isolation so the
 /// lock-guarded state can be read/written from the capture delegate's background queue.
 nonisolated final class RecordingState: @unchecked Sendable {
     private let lock = NSLock()
     private var _startTime: Date?
     private var _startPTS: CMTime?
-    
+    private var _cameraID: String?
+
     var startTime: Date? {
         get {
             lock.lock()
@@ -31,7 +41,7 @@ nonisolated final class RecordingState: @unchecked Sendable {
             lock.unlock()
         }
     }
-    
+
     var startPTS: CMTime? {
         get {
             lock.lock()
@@ -41,6 +51,20 @@ nonisolated final class RecordingState: @unchecked Sendable {
         set {
             lock.lock()
             _startPTS = newValue
+            lock.unlock()
+        }
+    }
+
+    /// `uniqueID` of the camera to capture with; `nil` falls back to the default.
+    var cameraID: String? {
+        get {
+            lock.lock()
+            defer { lock.unlock() }
+            return _cameraID
+        }
+        set {
+            lock.lock()
+            _cameraID = newValue
             lock.unlock()
         }
     }
@@ -61,8 +85,33 @@ class CameraManager: NSObject, ObservableObject {
     @Published var isAuthorized = false
     @Published private(set) var captureSession: AVCaptureSession?
     @Published var signalQuality: SignalQuality = .noisy
+
+    /// All rear cameras the user can pick between (populated on authorization).
+    @Published private(set) var availableCameras: [CameraOption] = []
+
+    /// `uniqueID` of the camera to record with. Persisted so a chosen lens
+    /// sticks across launches while experimenting with which gives the best
+    /// torch illumination. `nil` means "use the system default".
+    @Published var selectedCameraID: String? {
+        didSet {
+            UserDefaults.standard.set(selectedCameraID, forKey: Self.selectedCameraKey)
+        }
+    }
+
     var recordingLength: Int { recordingDuration }
-    
+
+    // MARK: - Camera Discovery
+
+    private static let selectedCameraKey = "climbpulse_selected_camera"
+
+    /// Rear physical lenses we let the user choose between. Ordered so the lens
+    /// physically closest to the LED torch (ultra-wide, on Pro models) comes first.
+    nonisolated private static let selectableDeviceTypes: [AVCaptureDevice.DeviceType] = [
+        .builtInUltraWideCamera,
+        .builtInWideAngleCamera,
+        .builtInTelephotoCamera
+    ]
+
     // MARK: - Private Properties
     
     private var videoOutput: AVCaptureVideoDataOutput?
@@ -91,11 +140,16 @@ class CameraManager: NSObject, ObservableObject {
     var onRecordingComplete: ((Measurement?) -> Void)?
     
     // MARK: - Setup
-    
+
+    override init() {
+        selectedCameraID = UserDefaults.standard.string(forKey: Self.selectedCameraKey)
+        super.init()
+    }
+
     /// Request camera authorization.
     func requestAuthorization() async {
         let status = AVCaptureDevice.authorizationStatus(for: .video)
-        
+
         switch status {
         case .authorized:
             isAuthorized = true
@@ -107,15 +161,87 @@ class CameraManager: NSObject, ObservableObject {
         @unknown default:
             isAuthorized = false
         }
+
+        if isAuthorized {
+            refreshAvailableCameras()
+        }
+    }
+
+    /// Enumerate the rear cameras and expose them for selection. Called after
+    /// authorization is granted (camera metadata is only available then).
+    func refreshAvailableCameras() {
+        let discovery = AVCaptureDevice.DiscoverySession(
+            deviceTypes: Self.selectableDeviceTypes,
+            mediaType: .video,
+            position: .back
+        )
+
+        // Present the lenses in a stable, meaningful order (ultra-wide, wide,
+        // telephoto) rather than trusting the discovery array's ordering.
+        let ordered = discovery.devices.sorted {
+            (Self.selectableDeviceTypes.firstIndex(of: $0.deviceType) ?? .max)
+                < (Self.selectableDeviceTypes.firstIndex(of: $1.deviceType) ?? .max)
+        }
+        availableCameras = ordered.map { device in
+            CameraOption(id: device.uniqueID, name: Self.displayName(for: device))
+        }
+
+        // If nothing is selected yet (or the saved lens is gone), fall back to the
+        // preferred default lens — ultra-wide, then wide, never telephoto.
+        if selectedCameraID == nil || !availableCameras.contains(where: { $0.id == selectedCameraID }) {
+            selectedCameraID = Self.preferredDefaultCamera(from: discovery.devices)?.uniqueID
+                ?? availableCameras.first?.id
+        }
+    }
+
+    /// Preferred default lens for PPG: ultra-wide (closest to the torch, shortest
+    /// minimum focus distance), then wide. Deliberately never telephoto (far from
+    /// the torch, can't focus on a pressed fingertip). Virtual multi-lens devices
+    /// are excluded upstream at the `DiscoverySession` level so iOS can't silently
+    /// switch physical lenses mid-recording and inject a step artifact.
+    nonisolated private static func preferredDefaultCamera(from devices: [AVCaptureDevice]) -> AVCaptureDevice? {
+        devices.first { $0.deviceType == .builtInUltraWideCamera }
+            ?? devices.first { $0.deviceType == .builtInWideAngleCamera }
+    }
+
+    /// Human-friendly label for a lens, e.g. "Ultra-Wide (0.5×)".
+    nonisolated private static func displayName(for device: AVCaptureDevice) -> String {
+        switch device.deviceType {
+        case .builtInUltraWideCamera:
+            return "Ultra-Wide (0.5×)"
+        case .builtInWideAngleCamera:
+            return "Wide (1×)"
+        case .builtInTelephotoCamera:
+            return "Telephoto"
+        default:
+            return device.localizedName
+        }
+    }
+
+    /// Resolve the `AVCaptureDevice` to use, preferring the given `uniqueID` and
+    /// falling back to the wide-angle lens (then any rear camera) if it's gone.
+    /// Shared by capture setup and torch control so they always agree.
+    nonisolated private static func resolveCamera(id: String?) -> AVCaptureDevice? {
+        let discovery = AVCaptureDevice.DiscoverySession(
+            deviceTypes: selectableDeviceTypes,
+            mediaType: .video,
+            position: .back
+        )
+        if let id, let match = discovery.devices.first(where: { $0.uniqueID == id }) {
+            return match
+        }
+        return preferredDefaultCamera(from: discovery.devices)
+            ?? discovery.devices.first
+            ?? AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .back)
     }
     
     /// Set up the capture session with back camera and torch.
     nonisolated private func setupCaptureSession() throws -> (AVCaptureSession, AVCaptureVideoDataOutput) {
         let session = AVCaptureSession()
         session.sessionPreset = .vga640x480  // Small frame, good throughput
-        
-        // Get back camera
-        guard let camera = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .back) else {
+
+        // Get the user-selected back camera (falls back to the wide-angle lens).
+        guard let camera = Self.resolveCamera(id: recordingState.cameraID) else {
             throw CameraError.cameraUnavailable
         }
         
@@ -181,7 +307,10 @@ class CameraManager: NSObject, ObservableObject {
         countdownStarted = false
         previousRedValue = nil
         detectionStartTimestamp = nil
-        
+
+        // Hand the chosen camera to the session-queue code in a thread-safe way.
+        recordingState.cameraID = selectedCameraID
+
         sessionQueue.async { [weak self] in
             guard let self = self else { return }
             
@@ -247,7 +376,7 @@ class CameraManager: NSObject, ObservableObject {
     
     /// Enable/disable camera torch.
     nonisolated private func setTorch(on: Bool) throws {
-        guard let device = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .back),
+        guard let device = Self.resolveCamera(id: recordingState.cameraID),
               device.hasTorch, device.isTorchAvailable else { return }
 
         do {
@@ -267,7 +396,7 @@ class CameraManager: NSObject, ObservableObject {
     /// Re-assert the torch if something (session reconfiguration, a transient
     /// interruption) has switched it back off while we are still recording.
     nonisolated private func ensureTorchOn() throws {
-        guard let device = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .back),
+        guard let device = Self.resolveCamera(id: recordingState.cameraID),
               device.hasTorch, device.isTorchAvailable, !device.isTorchActive else { return }
         try setTorch(on: true)
     }
