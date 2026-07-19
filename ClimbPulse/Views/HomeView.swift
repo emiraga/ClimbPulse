@@ -13,8 +13,6 @@ struct HomeView: View {
     @Environment(\.colorScheme) private var colorScheme
     
     @State private var showRecording = false
-    @State private var showResults = false
-    @State private var completedMeasurement: Measurement?
     
     // JYU-inspired palette
     private let primaryBlue = Color(red: 0.0, green: 0.34, blue: 0.65)      // #0056A5
@@ -139,29 +137,12 @@ struct HomeView: View {
                 }
             }
             .navigationBarTitleDisplayMode(.inline)
-            .toolbar {
-                ToolbarItem(placement: .navigationBarTrailing) {
-                    NavigationLink(destination: HistoryView()) {
-                        Image(systemName: "clock.arrow.circlepath")
-                            .font(.system(size: 18, weight: .medium))
-                            .foregroundColor(primaryText)
-                    }
-                }
-            }
             .fullScreenCover(isPresented: $showRecording) {
                 RecordingView(cameraManager: cameraManager) { measurement in
-                    completedMeasurement = measurement
+                    if let measurement {
+                        measurementStore.save(measurement)
+                    }
                     showRecording = false
-                    if measurement != nil {
-                        showResults = true
-                    }
-                }
-            }
-            .sheet(isPresented: $showResults) {
-                if let measurement = completedMeasurement {
-                    ResultsView(measurement: measurement) {
-                        showResults = false
-                    }
                 }
             }
             .task {

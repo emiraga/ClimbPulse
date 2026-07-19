@@ -5,29 +5,29 @@
 //  Live recording screen showing PPG waveform, BPM, and countdown timer.
 //
 
-import SwiftUI
 import AVFoundation
+import SwiftUI
 
 struct RecordingView: View {
     @ObservedObject var cameraManager: CameraManager
     let onComplete: (Measurement?) -> Void
-    
+
     @Environment(\.dismiss) private var dismiss
     @Environment(\.colorScheme) private var colorScheme
-    
+
     // Theme colors
     // JYU-inspired palette: deep blue + vivid orange
-    private let primaryBlue = Color(red: 0.0, green: 0.34, blue: 0.65)      // #0056A5
-    private let darkBlue = Color(red: 0.02, green: 0.16, blue: 0.32)       // #042948
-    private let accentOrange = Color(red: 1.0, green: 0.51, blue: 0.0)     // #FF8200
-    private let accentYellow = Color(red: 1.0, green: 0.72, blue: 0.11)    // #FFB81C
-    
+    private let primaryBlue = Color(red: 0.0, green: 0.34, blue: 0.65)  // #0056A5
+    private let darkBlue = Color(red: 0.02, green: 0.16, blue: 0.32)  // #042948
+    private let accentOrange = Color(red: 1.0, green: 0.51, blue: 0.0)  // #FF8200
+    private let accentYellow = Color(red: 1.0, green: 0.72, blue: 0.11)  // #FFB81C
+
     private var recordingProgress: Double {
         guard cameraManager.recordingLength > 0 else { return 0 }
         let elapsed = Double(cameraManager.recordingLength - cameraManager.timeRemaining)
         return max(0, min(1, elapsed / Double(cameraManager.recordingLength)))
     }
-    
+
     private var backgroundGradient: LinearGradient {
         let colors: [Color]
         if colorScheme == .dark {
@@ -37,27 +37,40 @@ struct RecordingView: View {
         }
         return LinearGradient(colors: colors, startPoint: .topLeading, endPoint: .bottomTrailing)
     }
-    
+
     var body: some View {
         ZStack {
             backgroundGradient
                 .ignoresSafeArea()
-            
+
             VStack(spacing: 26) {
-                Spacer().frame(height: 36) // push content below dynamic island/status bar
-                
+                Spacer().frame(height: 36)  // push content below dynamic island/status bar
+
                 VStack(spacing: 8) {
                     Text("Please keep still")
                         .font(.system(size: 20, weight: .semibold, design: .rounded))
                         .foregroundColor(.white)
-                    
+
                     Text("Gently cover the rear camera and flash with your fingertip.")
                         .font(.system(size: 15, weight: .medium, design: .rounded))
                         .foregroundColor(.white.opacity(0.8))
                         .multilineTextAlignment(.center)
                         .padding(.horizontal, 28)
                 }
-                
+
+                // Let the user try a different lens mid-measurement — the one
+                // closest to the torch usually gives the strongest signal.
+                // Tapping a segment restarts the capture on the new camera.
+                if cameraManager.availableCameras.count > 1 {
+                    CameraSegmentedSelector(
+                        cameras: cameraManager.availableCameras,
+                        selectedID: cameraManager.selectedCameraID,
+                        onSelect: { cameraManager.switchCamera(to: $0) },
+                        accent: accentOrange
+                    )
+                    .padding(.horizontal, 20)
+                }
+
                 // Live camera preview shown inside the BPM ring so users see the correct camera to cover
                 BPMPreviewRing(
                     session: cameraManager.captureSession,
@@ -67,7 +80,7 @@ struct RecordingView: View {
                     accent: accentOrange,
                     glow: accentYellow
                 )
-                
+
                 // Countdown timer
                 VStack(spacing: 10) {
                     HStack(alignment: .center) {
@@ -84,18 +97,18 @@ struct RecordingView: View {
                                 )
                         }
                         .accessibilityLabel("Cancel and discard")
-                        
+
                         Spacer()
-                        
+
                         // Time center
                         Text("\(cameraManager.timeRemaining)")
                             .font(.system(size: 60, weight: .bold, design: .rounded))
                             .foregroundColor(.white)
                             .monospacedDigit()
                             .frame(minWidth: 120)
-                        
+
                         Spacer()
-                        
+
                         // Stop/save early (right)
                         Button(action: finishEarly) {
                             Image(systemName: "stop.fill")
@@ -111,30 +124,22 @@ struct RecordingView: View {
                         .accessibilityLabel("Stop now and save")
                     }
                     .padding(.horizontal, 20)
-                    
-                    Text("seconds remaining")
-                        .font(.system(size: 15, weight: .medium, design: .rounded))
-                        .foregroundColor(.white.opacity(0.8))
                 }
-                
+
                 // PPG Waveform
                 VStack(alignment: .leading, spacing: 8) {
-                    Text("PPG Signal")
-                        .font(.system(size: 14, weight: .semibold, design: .rounded))
-                        .foregroundColor(.white.opacity(0.8))
-                    
                     PPGWaveformView(samples: cameraManager.filteredSamples)
                         .frame(height: 180)
                 }
                 .padding(.horizontal, 20)
-                
+
                 // Instructions
                 VStack(spacing: 12) {
                     FingerPlacementIndicator(
                         sampleCount: cameraManager.samples.count,
                         signalQuality: cameraManager.signalQuality
                     )
-                    
+
                     Text("Keep your finger steady on the rear camera + flash")
                         .font(.system(size: 15, weight: .medium, design: .rounded))
                         .foregroundColor(.white.opacity(0.8))
@@ -152,19 +157,19 @@ struct RecordingView: View {
             }
         }
     }
-    
+
     private func startRecording() {
         cameraManager.onRecordingComplete = { measurement in
             onComplete(measurement)
         }
         cameraManager.startRecording()
     }
-    
+
     private func finishEarly() {
         // Stop and let the normal completion flow show results
         cameraManager.stopRecording()
     }
-    
+
     private func cancelRecording() {
         // Stop and discard this attempt
         cameraManager.stopRecording()
@@ -175,10 +180,55 @@ struct RecordingView: View {
 
 // MARK: - Supporting Views
 
+/// Single-row lens picker for the recording screen. Each lens is a segment the
+/// user can switch to with one tap (no menu), styled to sit on the recording
+/// gradient. Uses the compact `shortName` so all lenses fit on one row.
+struct CameraSegmentedSelector: View {
+    let cameras: [CameraOption]
+    let selectedID: String?
+    let onSelect: (String?) -> Void
+    let accent: Color
+
+    var body: some View {
+        HStack(spacing: 4) {
+            ForEach(cameras) { camera in
+                let isSelected = camera.id == selectedID
+                Button {
+                    onSelect(camera.id)
+                } label: {
+                    Text(camera.shortName)
+                        .font(.system(size: 15, weight: .semibold, design: .rounded))
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.7)
+                        .foregroundColor(isSelected ? .white : .white.opacity(0.75))
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 10)
+                        .background(
+                            RoundedRectangle(cornerRadius: 10)
+                                .fill(isSelected ? accent : Color.clear)
+                        )
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel(camera.name)
+                .accessibilityAddTraits(isSelected ? .isSelected : [])
+            }
+        }
+        .padding(4)
+        .background(
+            RoundedRectangle(cornerRadius: 14)
+                .fill(Color.white.opacity(0.14))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 14)
+                .stroke(Color.white.opacity(0.18), lineWidth: 1)
+        )
+    }
+}
+
 struct FingerPlacementIndicator: View {
     let sampleCount: Int
     let signalQuality: SignalQuality
-    
+
     private var signalStrength: SignalStrength {
         if sampleCount < 10 {
             return .none
@@ -188,10 +238,10 @@ struct FingerPlacementIndicator: View {
             return .weak
         }
     }
-    
+
     enum SignalStrength {
         case none, weak, good
-        
+
         var color: Color {
             switch self {
             case .none: return .gray
@@ -199,7 +249,7 @@ struct FingerPlacementIndicator: View {
             case .good: return Color(red: 1.0, green: 0.51, blue: 0.0)
             }
         }
-        
+
         var text: String {
             switch self {
             case .none: return "No signal"
@@ -208,13 +258,13 @@ struct FingerPlacementIndicator: View {
             }
         }
     }
-    
+
     var body: some View {
         HStack(spacing: 8) {
             Circle()
                 .fill(signalStrength.color)
                 .frame(width: 8, height: 8)
-            
+
             Text(signalStrength.text)
                 .font(.system(size: 13, weight: .medium, design: .rounded))
                 .foregroundColor(.white.opacity(0.6))
@@ -233,11 +283,11 @@ struct BPMPreviewRing: View {
     let quality: SignalQuality
     let accent: Color
     let glow: Color
-    
+
     private var clampedProgress: Double {
         max(0, min(1, progress))
     }
-    
+
     private var qualityText: String {
         switch quality {
         case .good:
@@ -246,7 +296,7 @@ struct BPMPreviewRing: View {
             return "Adjust finger for clearer signal"
         }
     }
-    
+
     private var bpmText: String {
         if let bpm {
             return "\(bpm)"
@@ -254,7 +304,7 @@ struct BPMPreviewRing: View {
             return "--"
         }
     }
-    
+
     var body: some View {
         ZStack {
             // Live preview with a soft tint so users see exactly which camera/flash to cover
@@ -263,18 +313,18 @@ struct BPMPreviewRing: View {
                     LinearGradient(
                         colors: [
                             Color.black.opacity(0.45),
-                            Color.red.opacity(0.2)
+                            Color.red.opacity(0.2),
                         ],
                         startPoint: .top,
                         endPoint: .bottom
                     )
                 )
                 .clipShape(Circle())
-            
+
             // Base ring
             Circle()
                 .stroke(Color.white.opacity(0.22), lineWidth: 12)
-            
+
             // Progress ring (starts when countdown begins)
             Circle()
                 .trim(from: 0, to: clampedProgress)
@@ -283,7 +333,7 @@ struct BPMPreviewRing: View {
                         colors: [
                             accent,
                             glow,
-                            accent
+                            accent,
                         ],
                         center: .center
                     ),
@@ -291,19 +341,19 @@ struct BPMPreviewRing: View {
                 )
                 .rotationEffect(.degrees(-90))
                 .animation(.easeInOut(duration: 0.25), value: clampedProgress)
-            
+
             // BPM readout
             VStack(spacing: 4) {
                 Image(systemName: "heart.fill")
                     .font(.system(size: 28, weight: .semibold))
                     .foregroundColor(.white)
                     .symbolEffect(.pulse, options: .repeating, value: bpm != nil)
-                
+
                 Text(bpmText)
                     .font(.system(size: 58, weight: .bold, design: .rounded))
                     .foregroundColor(.white)
                     .contentTransition(.numericText())
-                
+
                 Text("bpm")
                     .font(.system(size: 18, weight: .semibold, design: .rounded))
                     .foregroundColor(.white.opacity(0.85))

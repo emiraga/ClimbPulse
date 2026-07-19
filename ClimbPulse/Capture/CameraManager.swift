@@ -16,6 +16,9 @@ import Combine
 struct CameraOption: Identifiable, Hashable, Sendable {
     let id: String
     let name: String
+    /// Compact label (e.g. "0.5×") for space-constrained controls like the
+    /// segmented selector on the recording screen.
+    let shortName: String
 }
 
 /// Thread-safe storage for state accessed from multiple threads (recording
@@ -80,7 +83,7 @@ class CameraManager: NSObject, ObservableObject {
     @Published var currentBPM: Int?
     @Published var samples: [PPGSample] = []
     @Published var filteredSamples: [PPGSample] = []  // Band-passed samples for UI display
-    @Published var timeRemaining: Int = 30
+    @Published var timeRemaining: Int = 60
     @Published var errorMessage: String?
     @Published var isAuthorized = false
     @Published private(set) var captureSession: AVCaptureSession?
@@ -123,7 +126,7 @@ class CameraManager: NSObject, ObservableObject {
     private let recordingState = RecordingState()
     
     private var timer: Timer?
-    private let recordingDuration: Int = 30
+    private let recordingDuration: Int = 60
 
     // Throttle for the torch keep-alive check (MainActor-isolated).
     private var lastTorchCheck: Date = .distantPast
@@ -183,7 +186,11 @@ class CameraManager: NSObject, ObservableObject {
                 < (Self.selectableDeviceTypes.firstIndex(of: $1.deviceType) ?? .max)
         }
         availableCameras = ordered.map { device in
-            CameraOption(id: device.uniqueID, name: Self.displayName(for: device))
+            CameraOption(
+                id: device.uniqueID,
+                name: Self.displayName(for: device),
+                shortName: Self.shortDisplayName(for: device)
+            )
         }
 
         // If nothing is selected yet (or the saved lens is gone), fall back to the
@@ -213,6 +220,20 @@ class CameraManager: NSObject, ObservableObject {
             return "Wide (1×)"
         case .builtInTelephotoCamera:
             return "Telephoto"
+        default:
+            return device.localizedName
+        }
+    }
+
+    /// Compact label for a lens, e.g. "0.5×", for the segmented selector.
+    nonisolated private static func shortDisplayName(for device: AVCaptureDevice) -> String {
+        switch device.deviceType {
+        case .builtInUltraWideCamera:
+            return "0.5×"
+        case .builtInWideAngleCamera:
+            return "1×"
+        case .builtInTelephotoCamera:
+            return "Tele"
         default:
             return device.localizedName
         }
@@ -372,8 +393,37 @@ class CameraManager: NSObject, ObservableObject {
         }
     }
     
+    /// Switch to a different rear lens. If a recording is in progress the live
+    /// capture session is torn down and rebuilt with the new camera (the sample
+    /// buffer and countdown restart from scratch, since the two lenses' signals
+    /// aren't comparable). Outside of a recording this just updates the stored
+    /// preference, exactly like the selector on the home screen.
+    func switchCamera(to id: String?) {
+        guard id != selectedCameraID else { return }
+        selectedCameraID = id
+
+        guard isRecording else { return }
+
+        // Stop the countdown; startRecording() will restart it once BPM is
+        // re-detected on the new lens.
+        timer?.invalidate()
+        timer = nil
+
+        // Stop the old session first. sessionQueue is serial, so this is
+        // guaranteed to run before startRecording()'s setup below. Stopping the
+        // session also releases the torch, which startRecording() re-enables.
+        let oldSession = captureSession
+        sessionQueue.async {
+            oldSession?.stopRunning()
+        }
+
+        // Rebuild the session with the freshly selected camera. This resets all
+        // sample/BPM/quality state, so no stale data from the old lens leaks in.
+        startRecording()
+    }
+
     // MARK: - Private Methods
-    
+
     /// Enable/disable camera torch.
     nonisolated private func setTorch(on: Bool) throws {
         guard let device = Self.resolveCamera(id: recordingState.cameraID),
