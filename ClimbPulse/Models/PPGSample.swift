@@ -2,7 +2,7 @@
 //  PPGSample.swift
 //  ClimbPulse
 //
-//  A single PPG sample with timestamp and red channel intensity value.
+//  A single PPG sample with timestamp and colour-channel intensity value.
 //
 
 import Foundation
@@ -11,7 +11,7 @@ import Foundation
 struct PPGSample: Codable, Identifiable {
     let id: UUID
     let timestamp: TimeInterval  // Seconds since recording started
-    let value: Double            // Average red channel intensity (0-255 normalized)
+    let value: Double            // Average channel intensity (0-255 normalized)
     
     init(timestamp: TimeInterval, value: Double) {
         self.id = UUID()

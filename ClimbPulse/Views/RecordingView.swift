@@ -15,6 +15,8 @@ struct RecordingView: View {
     @Environment(\.dismiss) private var dismiss
     @Environment(\.colorScheme) private var colorScheme
 
+    @State private var showTuning = false
+
     // Theme colors
     // JYU-inspired palette: deep blue + vivid orange
     private let primaryBlue = Color(red: 0.0, green: 0.34, blue: 0.65)  // #0056A5
@@ -38,7 +40,24 @@ struct RecordingView: View {
                 .ignoresSafeArea()
 
             VStack(spacing: 26) {
-                Spacer().frame(height: 36)  // push content below dynamic island/status bar
+                // Top bar: live signal-tuning access, kept clear of the ring.
+                HStack {
+                    Spacer()
+                    Button {
+                        showTuning = true
+                    } label: {
+                        Image(systemName: "slider.horizontal.3")
+                            .font(.system(size: 18, weight: .semibold))
+                            .foregroundColor(.white)
+                            .frame(width: 42, height: 42)
+                            .background(Color.white.opacity(0.18))
+                            .clipShape(Circle())
+                            .overlay(Circle().stroke(Color.white.opacity(0.3), lineWidth: 1))
+                    }
+                    .accessibilityLabel("Signal tuning")
+                }
+                .padding(.horizontal, 20)
+                .padding(.top, 36)  // clear the dynamic island / status bar
 
                 VStack(spacing: 8) {
                     Text("Please keep still")
@@ -129,7 +148,8 @@ struct RecordingView: View {
                 VStack(spacing: 12) {
                     FingerPlacementIndicator(
                         sampleCount: cameraManager.samples.count,
-                        signalQuality: cameraManager.signalQuality
+                        signalQuality: cameraManager.signalQuality,
+                        fingerDetected: cameraManager.fingerDetected
                     )
 
                     Text("Keep your finger steady on the rear camera + flash")
@@ -139,6 +159,9 @@ struct RecordingView: View {
                 .padding(.vertical, 12)
             }
             .padding(.vertical, 20)
+        }
+        .sheet(isPresented: $showTuning) {
+            CaptureTuningView(cameraManager: cameraManager)
         }
         .onAppear {
             startRecording()
@@ -220,9 +243,12 @@ struct CameraSegmentedSelector: View {
 struct FingerPlacementIndicator: View {
     let sampleCount: Int
     let signalQuality: SignalQuality
+    let fingerDetected: Bool
 
     private var signalStrength: SignalStrength {
-        if sampleCount < 10 {
+        if !fingerDetected {
+            return .noFinger
+        } else if sampleCount < 10 {
             return .none
         } else if signalQuality == .good {
             return .good
@@ -232,10 +258,11 @@ struct FingerPlacementIndicator: View {
     }
 
     enum SignalStrength {
-        case none, weak, good
+        case noFinger, none, weak, good
 
         var color: Color {
             switch self {
+            case .noFinger: return .red
             case .none: return .gray
             case .weak: return .yellow
             case .good: return Color(red: 1.0, green: 0.51, blue: 0.0)
@@ -244,6 +271,7 @@ struct FingerPlacementIndicator: View {
 
         var text: String {
             switch self {
+            case .noFinger: return "Place your finger on the camera lens"
             case .none: return "No signal"
             case .weak: return "Adjust finger for a clearer signal"
             case .good: return "Signal looks good"

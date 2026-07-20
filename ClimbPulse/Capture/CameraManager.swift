@@ -3,7 +3,9 @@
 //  ClimbPulse
 //
 //  Manages AVCaptureSession for PPG recording using the back camera with torch.
-//  Extracts average red channel values from each frame for heart rate estimation.
+//  Extracts an averaged colour-channel value from each frame for heart rate
+//  estimation. Capture options (channel, ROI, pixel filtering, torch level) are
+//  user-adjustable via CaptureTuning.
 //
 
 import Foundation
@@ -19,6 +21,48 @@ struct CameraOption: Identifiable, Hashable, Sendable {
     /// Compact label (e.g. "0.5×") for space-constrained controls like the
     /// segmented selector on the recording screen.
     let shortName: String
+}
+
+/// Colour channel averaged from each frame to form the PPG signal.
+/// `nonisolated` so the capture delegate (running off the main actor) can read it.
+nonisolated enum PPGChannel: String, CaseIterable, Identifiable, Sendable {
+    case red
+    case green
+
+    var id: String { rawValue }
+
+    var displayName: String {
+        switch self {
+        case .red: return "Red"
+        case .green: return "Green"
+        }
+    }
+}
+
+/// Snapshot of the user-adjustable capture options, read from the capture and
+/// torch code on their background queues. A value type so it can be copied out
+/// from under a lock without tearing. `nonisolated` so the capture/torch code
+/// off the main actor can read it.
+nonisolated struct CaptureTuning: Sendable, Equatable {
+    var channel: PPGChannel = .red
+    var useROI: Bool = true
+    var filterPixels: Bool = true
+    var torchLevel: Double = 0.3
+    /// Minimum red-to-blue ratio for a frame to count as "finger on the lens".
+    /// Partial coverage lets ambient light in and lowers this ratio, so a higher
+    /// value demands fuller coverage before measuring.
+    var minRedBlueRatio: Double = 2.0
+}
+
+/// Per-frame colour averages plus the selected-channel PPG value. Used both to
+/// build the PPG signal and to decide whether a fingertip is actually covering
+/// the lens. `nonisolated` so the capture delegate can produce it off the main
+/// actor.
+nonisolated struct FrameStats: Sendable {
+    let ppgValue: Double   // averaged selected channel (red or green)
+    let meanRed: Double
+    let meanGreen: Double
+    let meanBlue: Double
 }
 
 /// Thread-safe storage for state accessed from multiple threads (recording
@@ -71,6 +115,23 @@ nonisolated final class RecordingState: @unchecked Sendable {
             lock.unlock()
         }
     }
+
+    private var _tuning = CaptureTuning()
+
+    /// User-adjustable capture options, read per-frame by the capture delegate
+    /// and by the torch code.
+    var tuning: CaptureTuning {
+        get {
+            lock.lock()
+            defer { lock.unlock() }
+            return _tuning
+        }
+        set {
+            lock.lock()
+            _tuning = newValue
+            lock.unlock()
+        }
+    }
 }
 
 /// Manages camera capture and PPG signal extraction from video frames.
@@ -88,6 +149,11 @@ class CameraManager: NSObject, ObservableObject {
     @Published private(set) var captureSession: AVCaptureSession?
     @Published var signalQuality: SignalQuality = .noisy
 
+    /// Whether a fingertip currently appears to be covering the lens (frame is
+    /// mostly red/orange). Drives the "place your finger" prompt and gates which
+    /// frames contribute to the signal.
+    @Published private(set) var fingerDetected: Bool = false
+
     /// All rear cameras the user can pick between (populated on authorization).
     @Published private(set) var availableCameras: [CameraOption] = []
 
@@ -100,9 +166,70 @@ class CameraManager: NSObject, ObservableObject {
         }
     }
 
+    // MARK: - Signal Tuning (user-adjustable capture options)
+
+    /// Colour channel averaged for the PPG signal. Red has by far the best SNR
+    /// for transmission through a fingertip pressed over the torch; green is
+    /// offered for comparison / reflectance-style placement.
+    @Published var ppgChannel: PPGChannel = .red {
+        didSet {
+            UserDefaults.standard.set(ppgChannel.rawValue, forKey: Self.channelKey)
+            syncTuning()
+        }
+    }
+
+    /// Average only a centered region of the frame to avoid edge glare and
+    /// lens vignetting.
+    @Published var useROI: Bool = true {
+        didSet {
+            UserDefaults.standard.set(useROI, forKey: Self.roiKey)
+            syncTuning()
+        }
+    }
+
+    /// Drop under-exposed / saturated pixels, which carry no pulse information.
+    @Published var filterPixels: Bool = true {
+        didSet {
+            UserDefaults.standard.set(filterPixels, forKey: Self.pixelFilterKey)
+            syncTuning()
+        }
+    }
+
+    /// Torch brightness. Kept moderate (default 0.3, capped at 0.6) so the LED
+    /// stays cool and doesn't push the sensor into saturation.
+    @Published var torchLevel: Double = CameraManager.defaultTorchLevel {
+        didSet {
+            UserDefaults.standard.set(torchLevel, forKey: Self.torchLevelKey)
+            syncTuning()
+            reapplyTorchIfRecording()
+        }
+    }
+
+    /// How fully the fingertip must cover the lens before frames count (higher =
+    /// stricter). Expressed as the minimum red-to-blue ratio of the frame.
+    @Published var fingerCoverageStrictness: Double = CameraManager.defaultFingerStrictness {
+        didSet {
+            UserDefaults.standard.set(fingerCoverageStrictness, forKey: Self.fingerStrictnessKey)
+            syncTuning()
+        }
+    }
+
+    static let defaultTorchLevel: Double = 0.3
+    static let minUserTorchLevel: Double = 0.1
+    static let maxUserTorchLevel: Double = 0.6
+
+    static let defaultFingerStrictness: Double = 2.0
+    static let minFingerStrictness: Double = 1.2
+    static let maxFingerStrictness: Double = 3.5
+
     // MARK: - Camera Discovery
 
     private static let selectedCameraKey = "climbpulse_selected_camera"
+    private static let channelKey = "climbpulse_ppg_channel"
+    private static let roiKey = "climbpulse_use_roi"
+    private static let pixelFilterKey = "climbpulse_filter_pixels"
+    private static let torchLevelKey = "climbpulse_torch_level"
+    private static let fingerStrictnessKey = "climbpulse_finger_strictness"
 
     /// Rear physical lenses we let the user choose between. Ordered so the lens
     /// physically closest to the LED torch (ultra-wide, on Pro models) comes first.
@@ -117,7 +244,7 @@ class CameraManager: NSObject, ObservableObject {
     private var videoOutput: AVCaptureVideoDataOutput?
     private let sessionQueue = DispatchQueue(label: "com.climbpulse.camera.session")
     private let processingQueue = DispatchQueue(label: "com.climbpulse.camera.processing")
-    private var previousRedValue: Double?
+    private var previousPPGValue: Double?
 
     // Thread-safe recording state
     private let recordingState = RecordingState()
@@ -152,6 +279,60 @@ class CameraManager: NSObject, ObservableObject {
     override init() {
         selectedCameraID = UserDefaults.standard.string(forKey: Self.selectedCameraKey)
         super.init()
+        loadTuningFromDefaults()
+    }
+
+    /// Restore persisted tuning options (falling back to defaults) and seed the
+    /// thread-safe snapshot the capture code reads.
+    private func loadTuningFromDefaults() {
+        let defaults = UserDefaults.standard
+        if let raw = defaults.string(forKey: Self.channelKey),
+           let channel = PPGChannel(rawValue: raw) {
+            ppgChannel = channel
+        }
+        if defaults.object(forKey: Self.roiKey) != nil {
+            useROI = defaults.bool(forKey: Self.roiKey)
+        }
+        if defaults.object(forKey: Self.pixelFilterKey) != nil {
+            filterPixels = defaults.bool(forKey: Self.pixelFilterKey)
+        }
+        if defaults.object(forKey: Self.torchLevelKey) != nil {
+            torchLevel = min(Self.maxUserTorchLevel,
+                             max(Self.minUserTorchLevel, defaults.double(forKey: Self.torchLevelKey)))
+        }
+        if defaults.object(forKey: Self.fingerStrictnessKey) != nil {
+            fingerCoverageStrictness = min(Self.maxFingerStrictness,
+                                           max(Self.minFingerStrictness, defaults.double(forKey: Self.fingerStrictnessKey)))
+        }
+        syncTuning()  // ensure the snapshot is populated even if nothing was persisted
+    }
+
+    /// Push the current user-adjustable options into the lock-guarded snapshot
+    /// the capture/torch code reads from its background queues.
+    private func syncTuning() {
+        recordingState.tuning = CaptureTuning(
+            channel: ppgChannel,
+            useROI: useROI,
+            filterPixels: filterPixels,
+            torchLevel: torchLevel,
+            minRedBlueRatio: fingerCoverageStrictness
+        )
+    }
+
+    /// Re-apply the torch when its level changes mid-measurement so the new
+    /// brightness takes effect immediately.
+    private func reapplyTorchIfRecording() {
+        guard isRecording else { return }
+        sessionQueue.async { [weak self] in
+            guard let self else { return }
+            do {
+                try self.setTorch(on: true)
+            } catch {
+                Task { @MainActor in
+                    self.errorMessage = "Flash error: \(error.localizedDescription)"
+                }
+            }
+        }
     }
 
     /// Request camera authorization.
@@ -273,19 +454,33 @@ class CameraManager: NSObject, ObservableObject {
         
         // Configure camera for PPG capture
         try camera.lockForConfiguration()
-        
-        // Lock exposure and white balance for consistent readings
-        if camera.isExposureModeSupported(.locked) {
-            camera.exposureMode = .locked
+
+        // Start in continuous auto exposure / white balance so the sensor can
+        // settle on the finger+torch scene; both are locked shortly after the
+        // torch comes on (see lockExposureAndWhiteBalance). Locking here — before
+        // the torch and finger are in place — would freeze a dark-scene exposure
+        // that then actively fights the pulse waveform.
+        if camera.isExposureModeSupported(.continuousAutoExposure) {
+            camera.exposureMode = .continuousAutoExposure
         }
-        if camera.isWhiteBalanceModeSupported(.locked) {
-            camera.whiteBalanceMode = .locked
+        if camera.isWhiteBalanceModeSupported(.continuousAutoWhiteBalance) {
+            camera.whiteBalanceMode = .continuousAutoWhiteBalance
         }
-        
-        // Set frame rate to 30 fps for good temporal resolution
+
+        // Fixed 30 fps: plenty for heart-rate timing, and a constant frame
+        // duration keeps the signal from being resampled by auto frame-rate.
         camera.activeVideoMinFrameDuration = CMTime(value: 1, timescale: 30)
         camera.activeVideoMaxFrameDuration = CMTime(value: 1, timescale: 30)
-        
+
+        // We only need a spatial average, so pin zoom to the widest field and
+        // disable HDR — both otherwise distort a clean PPG waveform. These are
+        // always correct for PPG, so they aren't user-adjustable.
+        camera.videoZoomFactor = 1.0
+        if camera.activeFormat.isVideoHDRSupported {
+            camera.automaticallyAdjustsVideoHDREnabled = false
+            camera.isVideoHDREnabled = false
+        }
+
         camera.unlockForConfiguration()
         
         // Add camera input
@@ -307,7 +502,14 @@ class CameraManager: NSObject, ObservableObject {
             throw CameraError.cannotAddOutput
         }
         session.addOutput(output)
-        
+
+        // Video stabilization warps frames over time and would inject motion
+        // artifacts into the spatial average; disable it.
+        if let connection = output.connection(with: .video),
+           connection.isVideoStabilizationSupported {
+            connection.preferredVideoStabilizationMode = .off
+        }
+
         return (session, output)
     }
     
@@ -329,8 +531,9 @@ class CameraManager: NSObject, ObservableObject {
         recordingState.startPTS = nil
         captureSession = nil
         signalQuality = .noisy
+        fingerDetected = false
         detectionStarted = false
-        previousRedValue = nil
+        previousPPGValue = nil
         detectionStartTimestamp = nil
 
         // Hand the chosen camera to the session-queue code in a thread-safe way.
@@ -352,7 +555,14 @@ class CameraManager: NSObject, ObservableObject {
                 // Must be done AFTER the session is running, otherwise starting
                 // the session resets the torch mode and the flash never turns on.
                 try self.setTorch(on: true)
-                
+
+                // Give auto-exposure / white balance a moment to settle on the
+                // finger+torch scene, then lock them so they stop chasing (and
+                // cancelling) the pulse. Runs on the serial session queue.
+                self.sessionQueue.asyncAfter(deadline: .now() + 0.8) { [weak self] in
+                    self?.lockExposureAndWhiteBalance()
+                }
+
                 Task { @MainActor in
                     self.captureSession = session
                     self.videoOutput = output
@@ -429,13 +639,36 @@ class CameraManager: NSObject, ObservableObject {
             try device.lockForConfiguration()
             defer { device.unlockForConfiguration() }
             if on {
-                let desiredLevel = min(0.6, AVCaptureDevice.maxAvailableTorchLevel)
-                try device.setTorchModeOn(level: desiredLevel)  // Slightly dim to avoid sensor saturation
+                // User-selected level, clamped to what the hardware allows.
+                // `setTorchModeOn(level:)` takes a Float, so compute in Float.
+                let desiredLevel = min(max(Float(recordingState.tuning.torchLevel), 0.01),
+                                       AVCaptureDevice.maxAvailableTorchLevel)
+                try device.setTorchModeOn(level: desiredLevel)
             } else {
                 device.torchMode = .off
             }
         } catch {
             throw CameraError.torchUnavailable(underlying: error)
+        }
+    }
+
+    /// Freeze exposure and white balance after the sensor has settled on the
+    /// finger+torch scene, so auto-exposure / AWB stop cancelling the pulse.
+    nonisolated private func lockExposureAndWhiteBalance() {
+        guard let device = Self.resolveCamera(id: recordingState.cameraID) else { return }
+        do {
+            try device.lockForConfiguration()
+            defer { device.unlockForConfiguration() }
+            if device.isExposureModeSupported(.locked) {
+                device.exposureMode = .locked
+            }
+            if device.isWhiteBalanceModeSupported(.locked) {
+                device.whiteBalanceMode = .locked
+            }
+        } catch {
+            Task { @MainActor in
+                self.errorMessage = "Failed to lock exposure: \(error.localizedDescription)"
+            }
         }
     }
 
@@ -567,32 +800,39 @@ class CameraManager: NSObject, ObservableObject {
 
 extension CameraManager: AVCaptureVideoDataOutputSampleBufferDelegate {
     
-    /// Process each video frame to extract PPG signal.
+    /// Process each video frame to extract PPG signal. Frames that don't look
+    /// like a fingertip over the torch (i.e. not mostly red/orange) are dropped
+    /// and surfaced as a "place your finger" prompt instead of polluting the signal.
     nonisolated func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
-        
-        // Lazily set the first presentation timestamp to align future frames
+
+        // Extract per-frame colour stats (channel/ROI/filtering per tuning).
+        guard let stats = extractFrameStats(from: sampleBuffer),
+              Self.isFingerPresent(stats, minRedBlueRatio: recordingState.tuning.minRedBlueRatio) else {
+            Task { @MainActor in self.setFingerDetected(false) }
+            return
+        }
+
+        // Anchor t=0 to the first valid (finger-present) frame so the noisy
+        // "no finger yet" lead-in doesn't shift the timebase.
         if recordingState.startPTS == nil {
             recordingState.startPTS = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
         }
         guard let startPTS = recordingState.startPTS else { return }
-        
-        // Extract PPG signal from frame (now using green channel from ROI)
-        guard let ppgValue = extractPPGSignal(from: sampleBuffer) else { return }
-        // Temporarily remove frame-level filtering to debug signal flow
-        // guard ppgValue > 5 && ppgValue < 250 else { return }  // Skip too dark/saturated frames
-        
+
         let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
         let relative = CMTimeSubtract(pts, startPTS)
         let timestamp = CMTimeGetSeconds(relative)
-        
+
         Task { @MainActor in
-            self.appendSample(value: ppgValue, timestamp: timestamp)
+            self.appendSample(value: stats.ppgValue, timestamp: timestamp)
         }
     }
     
     /// Append a smoothed PPG sample on the main actor to avoid cross-thread state mutation.
     @MainActor
     private func appendSample(value: Double, timestamp: Double) {
+        if !fingerDetected { fingerDetected = true }
+
         let smoothed = smoothPPGValue(value)
         let limited = clampJump(smoothed)
         let sample = PPGSample(timestamp: timestamp, value: limited)
@@ -613,6 +853,16 @@ extension CameraManager: AVCaptureVideoDataOutputSampleBufferDelegate {
         )
         updateBPMIfNeeded()
         maybeReassertTorch()
+    }
+
+    /// Update the finger-present state; when the finger is lifted, mark the
+    /// signal noisy so a stale "good" reading doesn't linger behind the prompt.
+    @MainActor
+    private func setFingerDetected(_ detected: Bool) {
+        if fingerDetected != detected { fingerDetected = detected }
+        if !detected {
+            signalQuality = .noisy
+        }
     }
 
     /// Re-assert the torch at most once per second while recording, in case a
@@ -642,8 +892,8 @@ extension CameraManager: AVCaptureVideoDataOutputSampleBufferDelegate {
     private func smoothPPGValue(_ newValue: Double) -> Double {
         let clamped = min(max(newValue, 0), 255)
         
-        guard let previous = previousRedValue else {
-            previousRedValue = clamped
+        guard let previous = previousPPGValue else {
+            previousPPGValue = clamped
             return clamped
         }
         
@@ -651,7 +901,7 @@ extension CameraManager: AVCaptureVideoDataOutputSampleBufferDelegate {
         let jump = abs(clamped - previous)
         let alpha: Double = jump > 60 ? 0.18 : 0.32
         let blended = previous * (1 - alpha) + clamped * alpha
-        previousRedValue = blended
+        previousPPGValue = blended
         return blended
     }
     
@@ -668,11 +918,13 @@ extension CameraManager: AVCaptureVideoDataOutputSampleBufferDelegate {
         return prev + (delta > 0 ? maxDelta : -maxDelta)
     }
     
-    /// Extract PPG signal from centered ROI using green channel for improved SNR.
-    /// Uses centered ROI to avoid edge glare/vignetting, filters out saturated/dim pixels,
-    /// and uses green channel which typically provides better PPG signal than red.
-    nonisolated private func extractPPGSignal(from sampleBuffer: CMSampleBuffer) -> Double? {
+    /// Average the frame's colour channels (over the optional centered ROI, with
+    /// optional dark/saturated pixel filtering) into `FrameStats`. Channel, ROI,
+    /// and filtering are all driven by the user-adjustable tuning snapshot.
+    nonisolated private func extractFrameStats(from sampleBuffer: CMSampleBuffer) -> FrameStats? {
         guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return nil }
+
+        let tuning = recordingState.tuning
 
         CVPixelBufferLockBaseAddress(pixelBuffer, .readOnly)
         defer { CVPixelBufferUnlockBaseAddress(pixelBuffer, .readOnly) }
@@ -685,30 +937,65 @@ extension CameraManager: AVCaptureVideoDataOutputSampleBufferDelegate {
 
         let buffer = baseAddress.assumingMemoryBound(to: UInt8.self)
 
+        // BGRA byte order: B=0, G=1, R=2, A=3.
+        let usingRed = tuning.channel == .red
+
+        // Optionally restrict to the centered 50% region to avoid edge glare
+        // and lens vignetting.
+        let xStart = tuning.useROI ? width / 4 : 0
+        let xEnd = tuning.useROI ? width * 3 / 4 : width
+        let yStart = tuning.useROI ? height / 4 : 0
+        let yEnd = tuning.useROI ? height * 3 / 4 : height
+
+        var redSum: Int = 0
         var greenSum: Int = 0
+        var blueSum: Int = 0
         var validPixelCount: Int = 0
 
-        // BGRA format: B=0, G=1, R=2, A=3
-        // Sample the full frame with light subsampling to reduce noise while
-        // keeping computation low on the low-resolution buffer.
-        let step = 2  // every other pixel is enough at .low preset
-        for y in stride(from: 0, to: height, by: step) {
+        // Light subsampling reduces noise while keeping per-frame cost low.
+        let step = 2  // every other pixel is enough at this resolution
+        for y in stride(from: yStart, to: yEnd, by: step) {
             let rowStart = y * bytesPerRow
-            for x in stride(from: 0, to: width, by: step) {
-                let offset = rowStart + x * 4
-                let green = Int(buffer[offset + 1])  // Green channel
-
+            for x in stride(from: xStart, to: xEnd, by: step) {
+                let base = rowStart + x * 4
+                let blue = Int(buffer[base])
+                let green = Int(buffer[base + 1])
+                let red = Int(buffer[base + 2])
+                // Optionally drop under-exposed / saturated pixels (judged on the
+                // selected PPG channel) that carry no pulse.
+                let channelValue = usingRed ? red : green
+                if tuning.filterPixels && (channelValue < 10 || channelValue > 245) { continue }
+                redSum += red
                 greenSum += green
+                blueSum += blue
                 validPixelCount += 1
             }
         }
 
-        guard validPixelCount > 0 else { return nil }  // Need at least one pixel
+        guard validPixelCount > 0 else { return nil }  // Need at least one usable pixel
 
-        let avgGreen = Double(greenSum) / Double(validPixelCount)
+        let count = Double(validPixelCount)
+        let meanRed = Double(redSum) / count
+        let meanGreen = Double(greenSum) / count
+        return FrameStats(
+            ppgValue: usingRed ? meanRed : meanGreen,
+            meanRed: meanRed,
+            meanGreen: meanGreen,
+            meanBlue: Double(blueSum) / count
+        )
+    }
 
-        // Green channel typically has better SNR for PPG than red.
-        return avgGreen
+    /// Decide whether a fingertip is covering the lens. Light transmitted
+    /// through a finger over the torch is overwhelmingly red/orange: the red
+    /// channel is bright and clearly dominates blue (which tissue/blood absorb),
+    /// and red is at least as strong as green. `minRedBlueRatio` sets how fully
+    /// the finger must cover the lens — partial coverage lets in ambient light,
+    /// raising blue and lowering the ratio. Anything else (lens pointed at a
+    /// neutral or blue-ish scene, or too dark) is treated as "no finger".
+    nonisolated private static func isFingerPresent(_ stats: FrameStats, minRedBlueRatio: Double) -> Bool {
+        stats.meanRed > 40
+            && stats.meanRed > stats.meanBlue * minRedBlueRatio
+            && stats.meanRed >= stats.meanGreen
     }
 }
 
