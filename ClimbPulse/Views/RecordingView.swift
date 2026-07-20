@@ -363,19 +363,24 @@ struct BPMPreviewRing: View {
 
             // BPM readout — nudged up so it clears the waveform overlay at the bottom
             VStack(spacing: 4) {
-                Image(systemName: "heart.fill")
-                    .font(.system(size: 28, weight: .semibold))
-                    .foregroundColor(.white)
-                    .symbolEffect(.pulse, options: .repeating, value: bpm != nil)
+                // Only surface the heart + BPM value while a finger is on the lens —
+                // once it's lifted the reading is meaningless, so hide it entirely.
+                if fingerDetected {
+                    Image(systemName: "heart.fill")
+                        .font(.system(size: 28, weight: .semibold))
+                        .foregroundColor(.white)
+                        .symbolEffect(.pulse, options: .repeating, value: bpm != nil)
 
-                Text(bpmText)
-                    .font(.system(size: 58, weight: .bold, design: .rounded))
-                    .foregroundColor(.white)
-                    .contentTransition(.numericText())
+                    Text(bpmText)
+                        .font(.system(size: 58, weight: .bold, design: .rounded))
+                        .foregroundColor(.white)
+                        .contentTransition(.numericText())
 
-                Text("bpm")
-                    .font(.system(size: 18, weight: .semibold, design: .rounded))
-                    .foregroundColor(.white.opacity(0.85))
+                    Text("bpm")
+                        .font(.system(size: 18, weight: .semibold, design: .rounded))
+                        .foregroundColor(.white.opacity(0.85))
+                        .offset(y: -15)
+                }
             }
             .offset(y: fingerDetected ? -34 : 0)
             .animation(.easeInOut(duration: 0.25), value: fingerDetected)
