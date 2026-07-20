@@ -84,13 +84,24 @@ struct RecordingView: View {
                     .padding(.horizontal, 20)
                 }
 
-                // Live camera preview shown inside the BPM ring so users see the correct camera to cover
+                // Live camera preview shown inside the BPM ring so users see the correct camera to cover.
+                // The live PPG waveform is overlaid on the preview once a finger is detected.
                 BPMPreviewRing(
                     session: cameraManager.captureSession,
                     bpm: cameraManager.currentBPM,
                     quality: cameraManager.signalQuality,
+                    samples: cameraManager.filteredSamples,
+                    fingerDetected: cameraManager.fingerDetected,
                     accent: accentOrange,
                     glow: accentYellow
+                )
+
+                // Signal-strength readout kept right under the preview so the
+                // feedback sits next to what the user is adjusting.
+                FingerPlacementIndicator(
+                    sampleCount: cameraManager.samples.count,
+                    signalQuality: cameraManager.signalQuality,
+                    fingerDetected: cameraManager.fingerDetected
                 )
 
                 // Recording controls (measurement runs until the user stops it)
@@ -137,26 +148,13 @@ struct RecordingView: View {
                     .padding(.horizontal, 20)
                 }
 
-                // PPG Waveform
-                VStack(alignment: .leading, spacing: 8) {
-                    PPGWaveformView(samples: cameraManager.filteredSamples)
-                        .frame(height: 180)
-                }
-                .padding(.horizontal, 20)
-
                 // Instructions
-                VStack(spacing: 12) {
-                    FingerPlacementIndicator(
-                        sampleCount: cameraManager.samples.count,
-                        signalQuality: cameraManager.signalQuality,
-                        fingerDetected: cameraManager.fingerDetected
-                    )
-
-                    Text("Keep your finger steady on the rear camera + flash")
-                        .font(.system(size: 15, weight: .medium, design: .rounded))
-                        .foregroundColor(.white.opacity(0.8))
-                }
-                .padding(.vertical, 12)
+                Text("Keep your finger steady on the rear camera + flash")
+                    .font(.system(size: 15, weight: .medium, design: .rounded))
+                    .foregroundColor(.white.opacity(0.8))
+                    .multilineTextAlignment(.center)
+                    .padding(.horizontal, 28)
+                    .padding(.vertical, 12)
             }
             .padding(.vertical, 20)
         }
@@ -300,6 +298,8 @@ struct BPMPreviewRing: View {
     let session: AVCaptureSession?
     let bpm: Int?
     let quality: SignalQuality
+    let samples: [PPGSample]
+    let fingerDetected: Bool
     let accent: Color
     let glow: Color
 
@@ -334,6 +334,17 @@ struct BPMPreviewRing: View {
                         endPoint: .bottom
                     )
                 )
+                // Overlay the live PPG waveform directly on the preview, but only
+                // once a finger is covering the lens (otherwise it's just noise).
+                .overlay(alignment: .bottom) {
+                    if fingerDetected {
+                        PPGWaveformView(samples: samples)
+                            .frame(height: 90)
+                            .padding(.horizontal, 30)
+                            .padding(.bottom, 34)
+                            .transition(.opacity)
+                    }
+                }
                 .clipShape(Circle())
 
             // Ring around the live preview
@@ -350,7 +361,7 @@ struct BPMPreviewRing: View {
                     style: StrokeStyle(lineWidth: 14, lineCap: .round)
                 )
 
-            // BPM readout
+            // BPM readout — nudged up so it clears the waveform overlay at the bottom
             VStack(spacing: 4) {
                 Image(systemName: "heart.fill")
                     .font(.system(size: 28, weight: .semibold))
@@ -366,6 +377,8 @@ struct BPMPreviewRing: View {
                     .font(.system(size: 18, weight: .semibold, design: .rounded))
                     .foregroundColor(.white.opacity(0.85))
             }
+            .offset(y: fingerDetected ? -34 : 0)
+            .animation(.easeInOut(duration: 0.25), value: fingerDetected)
         }
         .frame(width: 280, height: 280)
         .shadow(color: glow.opacity(0.35), radius: 18, y: 10)
